@@ -4,3 +4,4 @@ torch
 numpy
 pytesseract
 Pillow
+python-docx
