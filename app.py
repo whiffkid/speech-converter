@@ -145,4 +145,8 @@ if uploaded_file is not None:
                             mime="text/plain",
                         )
                 except Exception as e:
-                    st.error(f
+                    st.error(f"Transcription failed: {e}")
+                finally:
+                    for p in [raw_path, clean_path]:
+                        if os.path.exists(p):
+                            os.remove(p)
