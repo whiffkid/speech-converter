@@ -14,10 +14,15 @@ st.write("Convert **Audio** (`.opus`, `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`) o
 AUDIO_EXTENSIONS = ["opus", "mp3", "wav", "m4a", "ogg", "flac"]
 IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
 
-# Load the CTranslate2 int8 model into cache (consumes only ~300-400MB RAM)
+# Load faster-whisper with distil-large-v3 (Large-v3 accuracy in a compact footprint)
+# Fallback to small.en if memory is constrained
 @st.cache_resource
 def load_whisper_engine():
-    return WhisperModel("small.en", device="cpu", compute_type="int8", cpu_threads=2)
+    try:
+        # distil-large-v3 provides Large-v3 vocabulary while fitting inside ~750MB RAM under int8
+        return WhisperModel("distil-whisper/distil-large-v3", device="cpu", compute_type="int8", cpu_threads=2)
+    except Exception:
+        return WhisperModel("small.en", device="cpu", compute_type="int8", cpu_threads=2)
 
 def create_docx(text: str, title: str) -> io.BytesIO:
     doc = Document()
@@ -71,13 +76,12 @@ if uploaded_file is not None:
                 except Exception as e:
                     st.error(f"Error extracting text: {e}")
 
-    # --- AUDIO TRANSCRIPTION (Self-Hosted faster-whisper) ---
+    # --- AUDIO TRANSCRIPTION ---
     elif file_ext in AUDIO_EXTENSIONS:
         st.audio(uploaded_file)
 
         if st.button("Transcribe Audio", type="primary"):
-            with st.spinner("Transcribing audio on Streamlit Cloud..."):
-                # Save audio to temporary disk location for ffmpeg decoding
+            with st.spinner("Transcribing with deterministic clinical decoding..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as raw_audio:
                     raw_audio.write(uploaded_file.read())
                     raw_path = raw_audio.name
@@ -85,13 +89,19 @@ if uploaded_file is not None:
                 try:
                     model = load_whisper_engine()
 
-                    # beam_size=5 explores multiple transcription paths for higher accuracy
-                    # vad_filter=True removes background silence and artifacts automatically
+                    # Decoding parameters tuned for clinical terminology:
+                    # 1. language="en": Prevents language hunting on accents
+                    # 2. temperature=0.0: Strictly deterministic (no random guessing)
+                    # 3. beam_size=5 & patience=1.0: Full search path exploration
+                    # 4. initial_prompt: Primes the decoder on hospital acronyms (ED, casualty, vitals)
                     segments, info = model.transcribe(
                         raw_path,
+                        language="en",
+                        temperature=0.0,
                         beam_size=5,
+                        patience=1.0,
                         vad_filter=True,
-                        initial_prompt="Clinical dictation, medical history, ED, patient presented with"
+                        initial_prompt="Clinical admission note: Patient presented to ED (Emergency Department) with hypertension, fatigue, heaviness of head."
                     )
 
                     transcription = " ".join([segment.text.strip() for segment in segments]).strip()
