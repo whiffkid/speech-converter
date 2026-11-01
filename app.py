@@ -17,7 +17,12 @@ st.write("Convert **Audio** (`.mp3`, `.opus`, `.wav`, `.m4a`, `.ogg`, `.flac`) o
 AUDIO_EXTENSIONS = ["opus", "mp3", "wav", "m4a", "ogg", "flac"]
 IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
 
-# Cache models per size
+# Permanent background vocabulary hint for medical, clinical notes, and abbreviations
+DEFAULT_SYSTEM_PROMPT = (
+    "Medical history, clinical notes, patient presented to the ED (Emergency Department) or OP. "
+    "Hypertension, diabetes, fatigue, headache, fever, vitals, examination, treatment, diagnosis."
+)
+
 @st.cache_resource
 def load_whisper_model(model_name: str):
     return whisper.load_model(model_name)
@@ -93,21 +98,12 @@ if uploaded_file is not None:
     elif file_ext in AUDIO_EXTENSIONS:
         st.audio(uploaded_file)
 
-        col_opt1, col_opt2 = st.columns(2)
-        with col_opt1:
-            # "small.en" or "small" gives significantly better accuracy for accents and clinical terms
-            model_size = st.selectbox("Whisper Model", ["small.en", "small", "base"], index=0)
-        with col_opt2:
-            enable_denoise = st.checkbox("Apply Noise Reduction", value=False)
-
-        prompt_hint = st.text_input(
-            "Context / Vocabulary Hints (Optional):", 
-            value="Medical clinical notes, emergency department, patient presented with fatigue, ED."
-        )
+        enable_denoise = st.checkbox("Apply Noise Reduction", value=False)
 
         if st.button("Transcribe Audio", type="primary"):
-            with st.spinner(f"Loading '{model_size}' model and processing..."):
-                model = load_whisper_model(model_size)
+            with st.spinner("Transcribing..."):
+                # Defaults to small.en for high English accuracy without prompting
+                model = load_whisper_model("small.en")
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as raw_audio:
                     raw_audio.write(uploaded_file.read())
@@ -122,17 +118,14 @@ if uploaded_file is not None:
                             denoise_audio(raw_path, clean_path)
                             transcription_target = clean_path
 
-                    with st.spinner("Transcribing..."):
-                        result = model.transcribe(
-                            transcription_target,
-                            fp16=False,
-                            initial_prompt=prompt_hint if prompt_hint else None
-                        )
-                        transcription = result["text"].strip()
-                        lang = result.get("language", "en")
+                    result = model.transcribe(
+                        transcription_target,
+                        fp16=False,
+                        initial_prompt=DEFAULT_SYSTEM_PROMPT
+                    )
+                    transcription = result["text"].strip()
 
                     st.success("Transcription complete!")
-                    st.caption(f"Detected language: **{lang.upper()}**")
                     st.text_area("Extracted Text", value=transcription, height=250)
 
                     col1, col2 = st.columns(2)
@@ -152,8 +145,4 @@ if uploaded_file is not None:
                             mime="text/plain",
                         )
                 except Exception as e:
-                    st.error(f"Transcription failed: {e}")
-                finally:
-                    for p in [raw_path, clean_path]:
-                        if os.path.exists(p):
-                            os.remove(p)
+                    st.error(f
