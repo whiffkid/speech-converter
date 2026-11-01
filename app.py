@@ -1,11 +1,10 @@
 import io
 import os
+import subprocess
 import tempfile
-import numpy as np
-import noisereduce as nr
 from docx import Document
+import noisereduce as nr
 from PIL import Image
-from pydub import AudioSegment
 import pytesseract
 import soundfile as sf
 import streamlit as st
@@ -33,21 +32,27 @@ def create_docx(text: str, title: str) -> io.BytesIO:
     return doc_io
 
 def denoise_audio(input_path: str, output_path: str):
-    """Converts audio to 16kHz mono WAV and applies spectral noise reduction."""
-    # Convert whatever input format to 16kHz mono WAV using pydub/ffmpeg
-    audio = AudioSegment.from_file(input_path)
-    audio = audio.set_channels(1).set_frame_rate(16000)
+    """Converts audio to 16kHz WAV with ffmpeg and applies spectral noise reduction."""
+    temp_wav = input_path + "_temp.wav"
+    try:
+        # Use system ffmpeg directly to convert to 16kHz mono WAV (no audioop needed)
+        cmd = [
+            "ffmpeg", "-y", "-i", input_path,
+            "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", temp_wav
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # Convert audio samples to numpy array
-    samples = np.array(audio.get_array_of_samples()).astype(np.float32)
-    max_val = float(2 ** (audio.sample_width * 8 - 1))
-    samples = samples / max_val
+        # Read samples with soundfile
+        samples, sr = sf.read(temp_wav, dtype="float32")
 
-    # Reduce stationary noise (hiss, hum, background static)
-    reduced_noise = nr.reduce_noise(y=samples, sr=16000, stationary=True, prop_decrease=0.85)
+        # Reduce stationary noise
+        reduced_noise = nr.reduce_noise(y=samples, sr=sr, stationary=True, prop_decrease=0.85)
 
-    # Save cleaned audio as standard WAV
-    sf.write(output_path, reduced_noise, 16000, format="WAV")
+        # Write clean output WAV
+        sf.write(output_path, reduced_noise, sr, format="WAV")
+    finally:
+        if os.path.exists(temp_wav):
+            os.remove(temp_wav)
 
 uploaded_file = st.file_uploader(
     "Upload a file", 
@@ -96,14 +101,12 @@ if uploaded_file is not None:
     elif file_ext in AUDIO_EXTENSIONS:
         st.audio(uploaded_file)
 
-        # Toggle for noise reduction
-        enable_denoise = st.checkbox("Apply Background Noise Reduction (recommended for noisy/distant audio)", value=True)
+        enable_denoise = st.checkbox("Apply Background Noise Reduction", value=True)
 
         if st.button("Transcribe Audio", type="primary"):
             with st.spinner("Processing audio..."):
                 model = load_whisper_model()
 
-                # Save raw upload to temp file
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as raw_audio:
                     raw_audio.write(uploaded_file.read())
                     raw_path = raw_audio.name
@@ -118,7 +121,6 @@ if uploaded_file is not None:
                             transcription_target = clean_path
 
                     with st.spinner("Transcribing..."):
-                        # FP16=False ensures smooth CPU execution on Streamlit Cloud
                         result = model.transcribe(transcription_target, fp16=False)
                         transcription = result["text"].strip()
                         lang = result.get("language", "unknown")
@@ -146,7 +148,6 @@ if uploaded_file is not None:
                 except Exception as e:
                     st.error(f"Transcription failed: {e}")
                 finally:
-                    # Clean up temporary disk files
                     for p in [raw_path, clean_path]:
                         if os.path.exists(p):
                             os.remove(p)
