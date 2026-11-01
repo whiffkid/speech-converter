@@ -1,8 +1,8 @@
 import io
-import os
-import tempfile
+import time
 from docx import Document
 from google import genai
+from google.genai import types
 from PIL import Image
 import pytesseract
 import streamlit as st
@@ -70,7 +70,7 @@ if uploaded_file is not None:
                 except Exception as e:
                     st.error(f"Error extracting text: {e}")
 
-    # --- AUDIO TRANSCRIPTION (Medical Understanding) ---
+    # --- AUDIO TRANSCRIPTION (With Automatic Retry & Fallback) ---
     elif file_ext in AUDIO_EXTENSIONS:
         st.audio(uploaded_file)
 
@@ -79,11 +79,6 @@ if uploaded_file is not None:
                 st.error("Missing Gemini API Key! Add it in Streamlit Secrets.")
             else:
                 with st.spinner("Transcribing clinical audio..."):
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as raw_audio:
-                        raw_audio.write(uploaded_file.read())
-                        raw_path = raw_audio.name
-
-                    uploaded_file_ref = None
                     try:
                         client = genai.Client(api_key=api_key)
 
@@ -97,23 +92,53 @@ if uploaded_file is not None:
                         }
                         chosen_mime = mime_map.get(file_ext, "audio/mp3")
 
-                        # Upload to Gemini File API
-                        uploaded_file_ref = client.files.upload(
-                            file=raw_path,
-                            config=dict(mime_type=chosen_mime)
+                        # Pass bytes inline for fast execution
+                        audio_part = types.Part.from_bytes(
+                            data=uploaded_file.getvalue(),
+                            mime_type=chosen_mime
                         )
 
                         system_prompt = (
                             "You are an expert medical transcriptionist specializing in Indian English clinical dictations. "
                             "Transcribe the audio accurately verbatim. Format clinical terms, medical abbreviations "
                             "(e.g., ED, BP, PR, SpO2, GRBS, ECG), symptoms, and drug names properly. "
-                            "Return only the final transcription without introductory conversational phrases."
+                            "Return only the final transcription text without conversational preamble or markdown code blocks."
                         )
 
-                        response = client.models.generate_content(
-                            model="gemini-3.8-flash",
-                            contents=[uploaded_file_ref, system_prompt]
-                        )
+                        # Cascade of supported active flash models
+                        candidate_models = [
+                            "gemini-3.8-flash",
+                            "gemini-3.6-flash",
+                            "gemini-3.5-flash-lite",
+                        ]
+
+                        response = None
+                        last_exception = None
+
+                        # Retry loop with backoff and model degradation
+                        for model_name in candidate_models:
+                            for attempt in range(2):  # up to 2 attempts per model
+                                try:
+                                    response = client.models.generate_content(
+                                        model=model_name,
+                                        contents=[audio_part, system_prompt]
+                                    )
+                                    if response and response.text:
+                                        break
+                                except Exception as err:
+                                    last_exception = err
+                                    err_str = str(err)
+                                    # If server is overloaded (503/429), wait and retry
+                                    if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                                        time.sleep(2)
+                                        continue
+                                    else:
+                                        break  # non-transient error, move to next model
+                            if response and response.text:
+                                break
+
+                        if not response or not response.text:
+                            raise last_exception
 
                         transcription = response.text.strip()
 
@@ -138,11 +163,3 @@ if uploaded_file is not None:
                             )
                     except Exception as e:
                         st.error(f"Transcription failed: {e}")
-                    finally:
-                        if uploaded_file_ref:
-                            try:
-                                client.files.delete(name=uploaded_file_ref.name)
-                            except Exception:
-                                pass
-                        if os.path.exists(raw_path):
-                            os.remove(raw_path)
