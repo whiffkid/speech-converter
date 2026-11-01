@@ -1,7 +1,8 @@
 streamlit
-faster-whisper
-av<19
+torch
+transformers
+torchaudio
+soundfile
 pytesseract
 Pillow
 python-docx
-symspellpy
