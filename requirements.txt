@@ -4,3 +4,4 @@ av<19
 pytesseract
 Pillow
 python-docx
+symspellpy
