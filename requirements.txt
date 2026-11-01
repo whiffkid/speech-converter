@@ -5,3 +5,7 @@ numpy
 pytesseract
 Pillow
 python-docx
+noisereduce
+pydub
+scipy
+soundfile
