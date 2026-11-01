@@ -17,12 +17,12 @@ st.write("Convert **Audio** (`.mp3`, `.opus`, `.wav`, `.m4a`, `.ogg`, `.flac`) o
 AUDIO_EXTENSIONS = ["opus", "mp3", "wav", "m4a", "ogg", "flac"]
 IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
 
+# Cache models per size
 @st.cache_resource
-def load_whisper_model():
-    return whisper.load_model("base")
+def load_whisper_model(model_name: str):
+    return whisper.load_model(model_name)
 
 def create_docx(text: str, title: str) -> io.BytesIO:
-    """Creates a downloadable .docx file in memory."""
     doc = Document()
     doc.add_heading(title, level=1)
     doc.add_paragraph(text)
@@ -32,23 +32,15 @@ def create_docx(text: str, title: str) -> io.BytesIO:
     return doc_io
 
 def denoise_audio(input_path: str, output_path: str):
-    """Converts audio to 16kHz WAV with ffmpeg and applies spectral noise reduction."""
     temp_wav = input_path + "_temp.wav"
     try:
-        # Use system ffmpeg directly to convert to 16kHz mono WAV (no audioop needed)
         cmd = [
             "ffmpeg", "-y", "-i", input_path,
             "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", temp_wav
         ]
         subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-        # Read samples with soundfile
         samples, sr = sf.read(temp_wav, dtype="float32")
-
-        # Reduce stationary noise
-        reduced_noise = nr.reduce_noise(y=samples, sr=sr, stationary=True, prop_decrease=0.85)
-
-        # Write clean output WAV
+        reduced_noise = nr.reduce_noise(y=samples, sr=sr, stationary=True, prop_decrease=0.7)
         sf.write(output_path, reduced_noise, sr, format="WAV")
     finally:
         if os.path.exists(temp_wav):
@@ -63,7 +55,7 @@ if uploaded_file is not None:
     file_ext = uploaded_file.name.split(".")[-1].lower()
     base_name = uploaded_file.name.rsplit(".", 1)[0]
 
-    # --- CASE 1: IMAGE FILE ---
+    # --- IMAGE OCR ---
     if file_ext in IMAGE_EXTENSIONS:
         image = Image.open(uploaded_file)
         st.image(image, caption="Uploaded Image", use_container_width=True)
@@ -97,15 +89,25 @@ if uploaded_file is not None:
                 except Exception as e:
                     st.error(f"Error extracting text: {e}")
 
-    # --- CASE 2: AUDIO FILE ---
+    # --- AUDIO TRANSCRIPTION ---
     elif file_ext in AUDIO_EXTENSIONS:
         st.audio(uploaded_file)
 
-        enable_denoise = st.checkbox("Apply Background Noise Reduction", value=True)
+        col_opt1, col_opt2 = st.columns(2)
+        with col_opt1:
+            # "small.en" or "small" gives significantly better accuracy for accents and clinical terms
+            model_size = st.selectbox("Whisper Model", ["small.en", "small", "base"], index=0)
+        with col_opt2:
+            enable_denoise = st.checkbox("Apply Noise Reduction", value=False)
+
+        prompt_hint = st.text_input(
+            "Context / Vocabulary Hints (Optional):", 
+            value="Medical clinical notes, emergency department, patient presented with fatigue, ED."
+        )
 
         if st.button("Transcribe Audio", type="primary"):
-            with st.spinner("Processing audio..."):
-                model = load_whisper_model()
+            with st.spinner(f"Loading '{model_size}' model and processing..."):
+                model = load_whisper_model(model_size)
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as raw_audio:
                     raw_audio.write(uploaded_file.read())
@@ -116,14 +118,18 @@ if uploaded_file is not None:
 
                 try:
                     if enable_denoise:
-                        with st.spinner("Filtering out background noise..."):
+                        with st.spinner("Filtering background audio..."):
                             denoise_audio(raw_path, clean_path)
                             transcription_target = clean_path
 
                     with st.spinner("Transcribing..."):
-                        result = model.transcribe(transcription_target, fp16=False)
+                        result = model.transcribe(
+                            transcription_target,
+                            fp16=False,
+                            initial_prompt=prompt_hint if prompt_hint else None
+                        )
                         transcription = result["text"].strip()
-                        lang = result.get("language", "unknown")
+                        lang = result.get("language", "en")
 
                     st.success("Transcription complete!")
                     st.caption(f"Detected language: **{lang.upper()}**")
