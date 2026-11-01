@@ -1,12 +1,12 @@
 import io
 import os
+import re
 import tempfile
 from docx import Document
+from faster_whisper import WhisperModel
 from PIL import Image
 import pytesseract
 import streamlit as st
-import torch
-from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 st.set_page_config(page_title="Medical Media to Text", page_icon="🩺")
 st.title("🩺 Medical Media to Text Converter")
@@ -15,30 +15,59 @@ st.write("Convert **Audio** (`.opus`, `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`) o
 AUDIO_EXTENSIONS = ["opus", "mp3", "wav", "m4a", "ogg", "flac"]
 IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
 
-# Load the dedicated medical speech recognition model from Hugging Face
-@st.cache_resource
-def load_medical_asr():
-    model_id = "mahwizzzz/medwhishper"
-    
-    # Load model in float32 for CPU inference
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id,
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-        use_safetensors=True
-    )
-    processor = AutoProcessor.from_pretrained(model_id)
+# Direct clinical terminology & acronym corrections
+CLINICAL_FIXES = {
+    # Acronyms & Hospital departments
+    r"\be\.d\b": "ED",
+    r"\bed\b": "ED",
+    r"\bcasualty\b": "Casualty",
+    r"\bo\.?p\.?d?\b": "OP",
+    r"\bi\.?p\.?d?\b": "IP",
+    r"\bb\.?p\b": "BP",
+    r"\bp\.?r\b": "PR",
+    r"\bsp\s?o2\b": "SpO2",
+    r"\bspo\s?2\b": "SpO2",
+    r"\bgrbs\b": "GRBS",
+    r"\be\.?c\.?g\b": "ECG",
+    r"\bcbc\b": "CBC",
+    r"\brft\b": "RFT",
+    r"\blft\b": "LFT",
+    r"\bcva\b": "CVA",
+    r"\bcad\b": "CAD",
+    r"\bcopd\b": "COPD",
+    # Symptoms & findings
+    r"\bhead ache\b": "headache",
+    r"\bgiddiness\b": "giddiness",
+    r"\bheaviness of head\b": "heaviness of head",
+    r"\bhypertension\b": "hypertension",
+    r"\bdiabetes mellitus\b": "diabetes mellitus",
+    r"\bdyspnea\b": "dyspnea",
+    r"\bsyncope\b": "syncope",
+    r"\btroponin\b": "troponin",
+    # Common medications
+    r"\bparacetamol\b": "paracetamol",
+    r"\bpantoprazole\b": "pantoprazole",
+    r"\batorvastatin\b": "atorvastatin",
+    r"\bmetformin\b": "metformin",
+    r"\btelmisartan\b": "telmisartan",
+    r"\bamlodipine\b": "amlodipine",
+    r"\bclopidogrel\b": "clopidogrel",
+    r"\baspirin\b": "aspirin",
+    r"\bceftriaxone\b": "ceftriaxone",
+    r"\bazithromycin\b": "azithromycin",
+}
 
-    # Initialize Hugging Face ASR pipeline
-    pipe = pipeline(
-        "automatic-speech-recognition",
-        model=model,
-        tokenizer=processor.tokenizer,
-        feature_extractor=processor.feature_extractor,
-        torch_dtype=torch.float32,
-        device="cpu",
-    )
-    return pipe
+@st.cache_resource
+def load_whisper():
+    return WhisperModel("small.en", device="cpu", compute_type="int8", cpu_threads=4)
+
+def clean_clinical_text(text: str) -> str:
+    cleaned = text
+    for pattern, replacement in CLINICAL_FIXES.items():
+        cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
+    # Ensure proper sentence casing
+    parts = re.split(r'([.?!]\s*)', cleaned)
+    return "".join([p.capitalize() if i % 2 == 0 else p for i, p in enumerate(parts)]).strip()
 
 def create_docx(text: str, title: str) -> io.BytesIO:
     doc = Document()
@@ -92,34 +121,38 @@ if uploaded_file is not None:
                 except Exception as e:
                     st.error(f"Error extracting text: {e}")
 
-    # --- AUDIO TRANSCRIPTION (Using Hugging Face Medical Whisper) ---
+    # --- AUDIO TRANSCRIPTION ---
     elif file_ext in AUDIO_EXTENSIONS:
         st.audio(uploaded_file)
 
         if st.button("Transcribe Audio", type="primary"):
-            with st.spinner("Loading medical model and transcribing clinical speech..."):
+            with st.spinner("Transcribing..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as raw_audio:
                     raw_audio.write(uploaded_file.read())
                     raw_path = raw_audio.name
 
                 try:
-                    asr_pipeline = load_medical_asr()
+                    model = load_whisper()
 
-                    # Transcribe using Hugging Face chunking for audio stability
-                    result = asr_pipeline(
+                    # Transcribe cleanly without hallucination-inducing prompt stuffing
+                    segments, info = model.transcribe(
                         raw_path,
-                        chunk_length_s=30,
-                        generate_kwargs={"language": "english", "task": "transcribe"}
+                        language="en",
+                        beam_size=3,
+                        temperature=0.0,
+                        vad_filter=True,
+                        vad_parameters=dict(min_silence_duration_ms=400)
                     )
 
-                    transcription = result["text"].strip()
+                    raw_text = " ".join([seg.text.strip() for seg in segments]).strip()
+                    final_text = clean_clinical_text(raw_text)
 
                     st.success("Transcription complete!")
-                    st.text_area("Transcribed Medical Note", value=transcription, height=250)
+                    st.text_area("Transcribed Text", value=final_text, height=250)
 
                     col1, col2 = st.columns(2)
                     with col1:
-                        docx_file = create_docx(transcription, f"Clinical Note - {uploaded_file.name}")
+                        docx_file = create_docx(final_text, f"Clinical Note - {uploaded_file.name}")
                         st.download_button(
                             label="📥 Download Word (.docx)",
                             data=docx_file,
@@ -129,12 +162,12 @@ if uploaded_file is not None:
                     with col2:
                         st.download_button(
                             label="📄 Download Text (.txt)",
-                            data=transcription,
+                            data=final_text,
                             file_name=f"{base_name}.txt",
                             mime="text/plain",
                         )
                 except Exception as e:
-                    st.error(f"Medical transcription failed: {e}")
+                    st.error(f"Transcription failed: {e}")
                 finally:
                     if os.path.exists(raw_path):
                         os.remove(raw_path)
