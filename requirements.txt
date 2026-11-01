@@ -1,5 +1,5 @@
 streamlit
-requests
+google-genai
 pytesseract
 Pillow
 python-docx
