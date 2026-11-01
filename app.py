@@ -1,73 +1,24 @@
 import io
 import os
-import re
-import tempfile
 from docx import Document
-from faster_whisper import WhisperModel
 from PIL import Image
 import pytesseract
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="Medical Media to Text", page_icon="🩺")
 st.title("🩺 Medical Media to Text Converter")
-st.write("Convert **Audio** (`.opus`, `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`) or **Images** (`.jpg`, `.jpeg`, `.png`) to text.")
+st.write("Transcribe clinical audio (`.opus`, `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`) or images (`.jpg`, `.jpeg`, `.png`).")
 
 AUDIO_EXTENSIONS = ["opus", "mp3", "wav", "m4a", "ogg", "flac"]
 IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
 
-# Direct clinical terminology & acronym corrections
-CLINICAL_FIXES = {
-    # Acronyms & Hospital departments
-    r"\be\.d\b": "ED",
-    r"\bed\b": "ED",
-    r"\bcasualty\b": "Casualty",
-    r"\bo\.?p\.?d?\b": "OP",
-    r"\bi\.?p\.?d?\b": "IP",
-    r"\bb\.?p\b": "BP",
-    r"\bp\.?r\b": "PR",
-    r"\bsp\s?o2\b": "SpO2",
-    r"\bspo\s?2\b": "SpO2",
-    r"\bgrbs\b": "GRBS",
-    r"\be\.?c\.?g\b": "ECG",
-    r"\bcbc\b": "CBC",
-    r"\brft\b": "RFT",
-    r"\blft\b": "LFT",
-    r"\bcva\b": "CVA",
-    r"\bcad\b": "CAD",
-    r"\bcopd\b": "COPD",
-    # Symptoms & findings
-    r"\bhead ache\b": "headache",
-    r"\bgiddiness\b": "giddiness",
-    r"\bheaviness of head\b": "heaviness of head",
-    r"\bhypertension\b": "hypertension",
-    r"\bdiabetes mellitus\b": "diabetes mellitus",
-    r"\bdyspnea\b": "dyspnea",
-    r"\bsyncope\b": "syncope",
-    r"\btroponin\b": "troponin",
-    # Common medications
-    r"\bparacetamol\b": "paracetamol",
-    r"\bpantoprazole\b": "pantoprazole",
-    r"\batorvastatin\b": "atorvastatin",
-    r"\bmetformin\b": "metformin",
-    r"\btelmisartan\b": "telmisartan",
-    r"\bamlodipine\b": "amlodipine",
-    r"\bclopidogrel\b": "clopidogrel",
-    r"\baspirin\b": "aspirin",
-    r"\bceftriaxone\b": "ceftriaxone",
-    r"\bazithromycin\b": "azithromycin",
-}
+API_URL = "https://api-inference.huggingface.co/models/openai/whisper-large-v3"
 
-@st.cache_resource
-def load_whisper():
-    return WhisperModel("small.en", device="cpu", compute_type="int8", cpu_threads=4)
-
-def clean_clinical_text(text: str) -> str:
-    cleaned = text
-    for pattern, replacement in CLINICAL_FIXES.items():
-        cleaned = re.sub(pattern, replacement, cleaned, flags=re.IGNORECASE)
-    # Ensure proper sentence casing
-    parts = re.split(r'([.?!]\s*)', cleaned)
-    return "".join([p.capitalize() if i % 2 == 0 else p for i, p in enumerate(parts)]).strip()
+# Fetch token from Streamlit Secrets or sidebar fallback
+hf_token = st.secrets.get("HF_TOKEN")
+if not hf_token:
+    hf_token = st.sidebar.text_input("Hugging Face Token (starts with hf_):", type="password")
 
 def create_docx(text: str, title: str) -> io.BytesIO:
     doc = Document()
@@ -77,6 +28,11 @@ def create_docx(text: str, title: str) -> io.BytesIO:
     doc.save(doc_io)
     doc_io.seek(0)
     return doc_io
+
+def query_whisper_large(audio_bytes: bytes, token: str):
+    headers = {"Authorization": f"Bearer {token}"}
+    response = requests.post(API_URL, headers=headers, data=audio_bytes, timeout=60)
+    return response.json()
 
 uploaded_file = st.file_uploader(
     "Upload audio or image file", 
@@ -121,53 +77,42 @@ if uploaded_file is not None:
                 except Exception as e:
                     st.error(f"Error extracting text: {e}")
 
-    # --- AUDIO TRANSCRIPTION ---
+    # --- AUDIO TRANSCRIPTION (Whisper Large v3) ---
     elif file_ext in AUDIO_EXTENSIONS:
         st.audio(uploaded_file)
 
         if st.button("Transcribe Audio", type="primary"):
-            with st.spinner("Transcribing..."):
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as raw_audio:
-                    raw_audio.write(uploaded_file.read())
-                    raw_path = raw_audio.name
+            if not hf_token:
+                st.error("Missing Hugging Face Token! Please add it to your Streamlit Secrets or sidebar.")
+            else:
+                with st.spinner("Transcribing with Whisper Large v3..."):
+                    try:
+                        audio_data = uploaded_file.read()
+                        output = query_whisper_large(audio_data, hf_token)
 
-                try:
-                    model = load_whisper()
+                        if "error" in output:
+                            st.error(f"Inference error: {output['error']}")
+                        else:
+                            transcription = output.get("text", "").strip()
 
-                    # Transcribe cleanly without hallucination-inducing prompt stuffing
-                    segments, info = model.transcribe(
-                        raw_path,
-                        language="en",
-                        beam_size=3,
-                        temperature=0.0,
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=400)
-                    )
+                            st.success("Transcription complete!")
+                            st.text_area("Transcribed Text", value=transcription, height=250)
 
-                    raw_text = " ".join([seg.text.strip() for seg in segments]).strip()
-                    final_text = clean_clinical_text(raw_text)
-
-                    st.success("Transcription complete!")
-                    st.text_area("Transcribed Text", value=final_text, height=250)
-
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        docx_file = create_docx(final_text, f"Clinical Note - {uploaded_file.name}")
-                        st.download_button(
-                            label="📥 Download Word (.docx)",
-                            data=docx_file,
-                            file_name=f"{base_name}.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        )
-                    with col2:
-                        st.download_button(
-                            label="📄 Download Text (.txt)",
-                            data=final_text,
-                            file_name=f"{base_name}.txt",
-                            mime="text/plain",
-                        )
-                except Exception as e:
-                    st.error(f"Transcription failed: {e}")
-                finally:
-                    if os.path.exists(raw_path):
-                        os.remove(raw_path)
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                docx_file = create_docx(transcription, f"Clinical Note - {uploaded_file.name}")
+                                st.download_button(
+                                label="📥 Download Word (.docx)",
+                                data=docx_file,
+                                file_name=f"{base_name}.docx",
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            )
+                            with col2:
+                                st.download_button(
+                                    label="📄 Download Text (.txt)",
+                                    data=transcription,
+                                    file_name=f"{base_name}.txt",
+                                    mime="text/plain",
+                                )
+                    except Exception as e:
+                        st.error(f"Transcription failed: {e}")
