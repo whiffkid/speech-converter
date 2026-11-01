@@ -2,7 +2,7 @@ import io
 import os
 import tempfile
 from docx import Document
-from huggingface_hub import InferenceClient
+from google import genai
 from PIL import Image
 import pytesseract
 import streamlit as st
@@ -14,10 +14,9 @@ st.write("Convert **Audio** (`.opus`, `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`) o
 AUDIO_EXTENSIONS = ["opus", "mp3", "wav", "m4a", "ogg", "flac"]
 IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
 
-# Fetch token from Streamlit Secrets or sidebar fallback
-hf_token = st.secrets.get("HF_TOKEN")
-if not hf_token:
-    hf_token = st.sidebar.text_input("Hugging Face Token (starts with hf_):", type="password")
+api_key = st.secrets.get("GEMINI_API_KEY")
+if not api_key:
+    api_key = st.sidebar.text_input("Gemini API Key:", type="password")
 
 def create_docx(text: str, title: str) -> io.BytesIO:
     doc = Document()
@@ -71,31 +70,52 @@ if uploaded_file is not None:
                 except Exception as e:
                     st.error(f"Error extracting text: {e}")
 
-    # --- AUDIO TRANSCRIPTION (Whisper Large v3 on Hugging Face Router) ---
+    # --- AUDIO TRANSCRIPTION (Medical Understanding) ---
     elif file_ext in AUDIO_EXTENSIONS:
         st.audio(uploaded_file)
 
         if st.button("Transcribe Audio", type="primary"):
-            if not hf_token:
-                st.error("Missing Hugging Face Token! Please add it to your Streamlit Secrets or sidebar.")
+            if not api_key:
+                st.error("Missing Gemini API Key! Add it in Streamlit Secrets.")
             else:
-                with st.spinner("Transcribing with Whisper Large v3..."):
-                    # Save temporary file for the InferenceClient
+                with st.spinner("Transcribing clinical audio..."):
                     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as raw_audio:
                         raw_audio.write(uploaded_file.read())
                         raw_path = raw_audio.name
 
+                    uploaded_file_ref = None
                     try:
-                        # Official Hugging Face client with provider routing
-                        client = InferenceClient(
-                            provider="hf-inference",
-                            api_key=hf_token
+                        client = genai.Client(api_key=api_key)
+
+                        mime_map = {
+                            "opus": "audio/ogg",
+                            "mp3": "audio/mp3",
+                            "wav": "audio/wav",
+                            "m4a": "audio/mp4",
+                            "ogg": "audio/ogg",
+                            "flac": "audio/flac",
+                        }
+                        chosen_mime = mime_map.get(file_ext, "audio/mp3")
+
+                        # Upload to Gemini File API
+                        uploaded_file_ref = client.files.upload(
+                            file=raw_path,
+                            config=dict(mime_type=chosen_mime)
                         )
 
-                        transcription = client.automatic_speech_recognition(
-                            raw_path,
-                            model="openai/whisper-large-v3"
-                        ).strip()
+                        system_prompt = (
+                            "You are an expert medical transcriptionist specializing in Indian English clinical dictations. "
+                            "Transcribe the audio accurately verbatim. Format clinical terms, medical abbreviations "
+                            "(e.g., ED, BP, PR, SpO2, GRBS, ECG), symptoms, and drug names properly. "
+                            "Return only the final transcription without introductory conversational phrases."
+                        )
+
+                        response = client.models.generate_content(
+                            model="gemini-2.5-flash",
+                            contents=[uploaded_file_ref, system_prompt]
+                        )
+
+                        transcription = response.text.strip()
 
                         st.success("Transcription complete!")
                         st.text_area("Transcribed Text", value=transcription, height=250)
@@ -119,5 +139,10 @@ if uploaded_file is not None:
                     except Exception as e:
                         st.error(f"Transcription failed: {e}")
                     finally:
+                        if uploaded_file_ref:
+                            try:
+                                client.files.delete(name=uploaded_file_ref.name)
+                            except Exception:
+                                pass
                         if os.path.exists(raw_path):
                             os.remove(raw_path)
