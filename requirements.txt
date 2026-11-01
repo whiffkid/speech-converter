@@ -1,10 +1,5 @@
 streamlit
-openai-whisper
-torch
-numpy
+faster-whisper
 pytesseract
 Pillow
 python-docx
-noisereduce
-scipy
-soundfile
