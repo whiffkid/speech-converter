@@ -1,8 +1,5 @@
 streamlit
-torch
-transformers
-torchaudio
-soundfile
+requests
 pytesseract
 Pillow
 python-docx
