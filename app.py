@@ -1,11 +1,13 @@
 import io
 import os
+import re
 import tempfile
 from docx import Document
 from faster_whisper import WhisperModel
 from PIL import Image
 import pytesseract
 import streamlit as st
+from symspellpy import SymSpell, Verbosity
 
 st.set_page_config(page_title="Medical Media to Text", page_icon="🩺")
 st.title("🩺 Medical Media to Text Converter")
@@ -14,15 +16,57 @@ st.write("Convert **Audio** (`.opus`, `.mp3`, `.wav`, `.m4a`, `.ogg`, `.flac`) o
 AUDIO_EXTENSIONS = ["opus", "mp3", "wav", "m4a", "ogg", "flac"]
 IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
 
-# Load faster-whisper with distil-large-v3 (Large-v3 accuracy in a compact footprint)
-# Fallback to small.en if memory is constrained
+# Common Indian clinical acronyms and terminology mappings
+CLINICAL_FIXES = {
+    r"\be\.d\b": "ED",
+    r"\bed\b": "ED",
+    r"\bcasualty\b": "Casualty",
+    r"\bop\b": "OP",
+    r"\bo\.p\b": "OP",
+    r"\bip\b": "IP",
+    r"\bbp\b": "BP",
+    r"\bpr\b": "PR",
+    r"\bspo2\b": "SpO2",
+    r"\bgrbs\b": "GRBS",
+    r"\becg\b": "ECG",
+    r"\bhead ache\b": "headache",
+    r"\bgiddiness\b": "giddiness",
+    r"\bheaviness of head\b": "heaviness of head",
+    r"\bhypertension\b": "hypertension",
+    r"\bdiabetes mellitus\b": "diabetes mellitus",
+    r"\bdyspnea\b": "dyspnea",
+    r"\bsyncope\b": "syncope",
+    r"\bparacetamol\b": "paracetamol",
+    r"\bpantoprazole\b": "pantoprazole",
+    r"\batorvastatin\b": "atorvastatin",
+    r"\bmetformin\b": "metformin",
+    r"\btelmisartan\b": "telmisartan",
+    r"\bamlodipine\b": "amlodipine",
+    r"\bclopidogrel\b": "clopidogrel",
+    r"\baspirin\b": "aspirin",
+    r"\bceftriaxone\b": "ceftriaxone",
+    r"\bazithromycin\b": "azithromycin",
+    r"\btroponin\b": "troponin",
+    r"\bcbc\b": "CBC",
+    r"\brft\b": "RFT",
+    r"\blft\b": "LFT",
+}
+
 @st.cache_resource
-def load_whisper_engine():
-    try:
-        # distil-large-v3 provides Large-v3 vocabulary while fitting inside ~750MB RAM under int8
-        return WhisperModel("distil-whisper/distil-large-v3", device="cpu", compute_type="int8", cpu_threads=2)
-    except Exception:
-        return WhisperModel("small.en", device="cpu", compute_type="int8", cpu_threads=2)
+def load_speech_engine():
+    # Uses base.en or small.en under int8 CPU inference
+    return WhisperModel("small.en", device="cpu", compute_type="int8", cpu_threads=2)
+
+def post_process_medical_text(text: str) -> str:
+    corrected = text
+    # Run regex-based medical entity and acronym alignment
+    for pattern, replacement in CLINICAL_FIXES.items():
+        corrected = re.sub(pattern, replacement, corrected, flags=re.IGNORECASE)
+    
+    # Capitalize start of sentences
+    sentences = re.split(r'([.?!]\s*)', corrected)
+    corrected = "".join([s.capitalize() if i % 2 == 0 else s for i, s in enumerate(sentences)])
+    return corrected.strip()
 
 def create_docx(text: str, title: str) -> io.BytesIO:
     doc = Document()
@@ -76,42 +120,40 @@ if uploaded_file is not None:
                 except Exception as e:
                     st.error(f"Error extracting text: {e}")
 
-    # --- AUDIO TRANSCRIPTION ---
+    # --- AUDIO TRANSCRIPTION + MEDICAL COMPARISON ---
     elif file_ext in AUDIO_EXTENSIONS:
         st.audio(uploaded_file)
 
         if st.button("Transcribe Audio", type="primary"):
-            with st.spinner("Transcribing with deterministic clinical decoding..."):
+            with st.spinner("Transcribing and applying medical lexicon normalization..."):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as raw_audio:
                     raw_audio.write(uploaded_file.read())
                     raw_path = raw_audio.name
 
                 try:
-                    model = load_whisper_engine()
+                    model = load_speech_engine()
 
-                    # Decoding parameters tuned for clinical terminology:
-                    # 1. language="en": Prevents language hunting on accents
-                    # 2. temperature=0.0: Strictly deterministic (no random guessing)
-                    # 3. beam_size=5 & patience=1.0: Full search path exploration
-                    # 4. initial_prompt: Primes the decoder on hospital acronyms (ED, casualty, vitals)
+                    # Transcribe with standard English decoder settings
                     segments, info = model.transcribe(
                         raw_path,
                         language="en",
                         temperature=0.0,
                         beam_size=5,
-                        patience=1.0,
                         vad_filter=True,
-                        initial_prompt="Clinical admission note: Patient presented to ED (Emergency Department) with hypertension, fatigue, heaviness of head."
+                        vad_parameters=dict(min_silence_duration_ms=400)
                     )
 
-                    transcription = " ".join([segment.text.strip() for segment in segments]).strip()
+                    raw_transcription = " ".join([seg.text.strip() for seg in segments]).strip()
+
+                    # Stage 2: Compare against clinical dictionary
+                    final_transcription = post_process_medical_text(raw_transcription)
 
                     st.success("Transcription complete!")
-                    st.text_area("Transcribed Text", value=transcription, height=250)
+                    st.text_area("Transcribed Clinical Text", value=final_transcription, height=250)
 
                     col1, col2 = st.columns(2)
                     with col1:
-                        docx_file = create_docx(transcription, f"Clinical Note - {uploaded_file.name}")
+                        docx_file = create_docx(final_transcription, f"Clinical Note - {uploaded_file.name}")
                         st.download_button(
                             label="📥 Download Word (.docx)",
                             data=docx_file,
@@ -121,7 +163,7 @@ if uploaded_file is not None:
                     with col2:
                         st.download_button(
                             label="📄 Download Text (.txt)",
-                            data=transcription,
+                            data=final_transcription,
                             file_name=f"{base_name}.txt",
                             mime="text/plain",
                         )
